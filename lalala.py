@@ -1,3 +1,3 @@
 import os 
-os.setuid(0)
+os.setuid(1000)
 print(os.listdir("./"))
